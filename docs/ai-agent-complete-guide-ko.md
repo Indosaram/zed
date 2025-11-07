@@ -692,6 +692,463 @@ pub enum EditAgentOutputEvent {
 }
 ```
 
+## 편집 적용 및 리뷰 시스템
+
+### 개요
+
+에이전트가 생성한 편집 사항은 즉시 파일에 적용되지 않고, 사용자가 검토하고 승인/거부할 수 있는 diff 형태로 표시됩니다. 이는 안전한 코드 편집을 위한 핵심 메커니즘입니다.
+
+### 편집 적용 흐름
+
+```
+┌─────────────────────┐
+│ Agent generates     │
+│ edit suggestions    │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│ ActionLog tracks    │
+│ unreviewed edits    │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│ BufferDiff creates  │
+│ diff hunks          │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│ AgentDiffPane       │
+│ displays changes    │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│ User reviews and    │
+│ Keep/Reject hunks   │
+└──────────┬──────────┘
+           │
+     ┌─────┴─────┐
+     │           │
+     ▼           ▼
+┌────────┐  ┌────────┐
+│ Keep   │  │ Reject │
+└───┬────┘  └───┬────┘
+    │           │
+    ▼           ▼
+┌────────────────────┐
+│ Update diff_base   │
+│ or revert buffer   │
+└────────────────────┘
+```
+
+### 핵심 컴포넌트
+
+#### 1. ActionLog - 편집 추적
+
+**역할**: 에이전트가 수행한 모든 편집을 추적하고 관리
+
+```rust
+pub struct ActionLog {
+    tracked_buffers: BTreeMap<Entity<Buffer>, TrackedBuffer>,
+    project: Entity<Project>,
+}
+
+struct TrackedBuffer {
+    buffer: Entity<Buffer>,
+    snapshot: text::BufferSnapshot,
+    diff_base: Rope,  // 기준 텍스트
+    last_seen_base: Rope,
+    unreviewed_edits: Vec<UnreviewedEdit>,
+    status: TrackedBufferStatus,
+}
+
+struct UnreviewedEdit {
+    old: Range<u32>,  // diff_base의 행 범위
+    new: Range<u32>,  // 현재 buffer의 행 범위
+}
+```
+
+**주요 메서드**:
+
+```rust
+// 편집 승인 (Keep)
+pub fn keep_edits_in_range(
+    &mut self,
+    buffer: Entity<Buffer>,
+    buffer_range: Range<impl ToPoint>,
+    cx: &mut Context<Self>,
+) {
+    // 1. 승인된 범위의 편집을 찾음
+    // 2. diff_base를 현재 버퍼 내용으로 업데이트
+    // 3. unreviewed_edits에서 제거
+    // 4. BufferDiff 재계산 요청
+}
+
+// 편집 거부 (Reject)
+pub fn reject_edits_in_ranges(
+    &mut self,
+    buffer: Entity<Buffer>,
+    buffer_ranges: Vec<Range<impl ToPoint>>,
+    cx: &mut Context<Self>,
+) -> Task<Result<()>> {
+    // 1. 거부할 범위의 편집을 찾음
+    // 2. 버퍼를 diff_base 내용으로 되돌림
+    // 3. unreviewed_edits에서 제거
+    // 4. BufferDiff 재계산 요청
+}
+
+// 모든 편집 승인
+pub fn keep_all_edits(&mut self, cx: &mut Context<Self>) {
+    // 모든 tracked_buffers의 편집을 승인
+}
+```
+
+#### 2. BufferDiff - Diff 계산 및 표시
+
+**역할**: 기준 텍스트(diff_base)와 현재 버퍼의 차이를 계산
+
+```rust
+pub struct BufferDiff {
+    buffer_id: BufferId,
+    inner: BufferDiffInner,
+}
+
+struct BufferDiffInner {
+    hunks: SumTree<InternalDiffHunk>,  // 계산된 diff hunk들
+    pending_hunks: SumTree<PendingHunk>,
+    base_text: BufferSnapshot,  // 비교 기준
+    base_text_exists: bool,
+}
+
+pub struct DiffHunk {
+    range: Range<Point>,  // 버퍼의 행 범위
+    buffer_range: Range<Anchor>,
+    diff_base_byte_range: Range<usize>,
+    secondary_status: DiffHunkSecondaryStatus,
+}
+```
+
+**Diff Hunk 상태**:
+```rust
+pub enum DiffHunkStatusKind {
+    Added,    // 새로 추가된 내용
+    Modified, // 수정된 내용
+    Deleted,  // 삭제된 내용
+}
+```
+
+#### 3. AgentDiffPane - UI 표시 및 상호작용
+
+**역할**: diff를 시각적으로 표시하고 사용자 상호작용 처리
+
+```rust
+pub struct AgentDiffPane {
+    multibuffer: Entity<MultiBuffer>,  // 여러 파일의 diff 표시
+    editor: Entity<Editor>,            // diff 편집기
+    thread: AgentDiffThread,           // 연결된 에이전트 스레드
+    focus_handle: FocusHandle,
+    workspace: WeakEntity<Workspace>,
+}
+```
+
+**사용자 액션**:
+
+1. **Keep** - 현재 커서/선택 영역의 변경사항 승인
+```rust
+fn keep(&mut self, _: &Keep, window: &mut Window, cx: &mut Context<Self>) {
+    self.editor.update(cx, |editor, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        keep_edits_in_selection(editor, &snapshot, &self.thread, window, cx);
+    });
+}
+```
+
+2. **Reject** - 현재 커서/선택 영역의 변경사항 거부
+```rust
+fn reject(&mut self, _: &Reject, window: &mut Window, cx: &mut Context<Self>) {
+    self.editor.update(cx, |editor, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        reject_edits_in_selection(editor, &snapshot, &self.thread, window, cx);
+    });
+}
+```
+
+3. **Keep All** - 모든 변경사항 승인
+```rust
+fn keep_all(&mut self, _: &KeepAll, _window: &mut Window, cx: &mut Context<Self>) {
+    self.thread
+        .action_log(cx)
+        .update(cx, |action_log, cx| action_log.keep_all_edits(cx))
+}
+```
+
+4. **Reject All** - 모든 변경사항 거부
+```rust
+fn reject_all(&mut self, _: &RejectAll, window: &mut Window, cx: &mut Context<Self>) {
+    self.editor.update(cx, |editor, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        reject_edits_in_ranges(
+            editor,
+            &snapshot,
+            &self.thread,
+            vec![editor::Anchor::min()..editor::Anchor::max()],
+            window,
+            cx,
+        );
+    });
+}
+```
+
+### UI 컨트롤
+
+#### Diff Hunk 컨트롤
+
+각 diff hunk에는 다음 버튼이 표시됩니다:
+
+```rust
+// Reject 버튼
+Button::new(("reject", row), "Reject")
+    .key_binding(KeyBinding::for_action_in(&Reject, &editor, cx))
+    .on_click(|_, window, cx| {
+        editor.dispatch_action(&Reject, window, cx)
+    })
+
+// Keep 버튼
+Button::new(("keep", row), "Keep")
+    .key_binding(KeyBinding::for_action_in(&Keep, &editor, cx))
+    .on_click(|_, window, cx| {
+        editor.dispatch_action(&Keep, window, cx)
+    })
+```
+
+#### 전체 컨트롤
+
+패널 상단에는 전체 액션 버튼이 표시됩니다:
+
+```rust
+// Reject All 버튼
+Button::new("reject-all", "Reject All")
+    .key_binding(KeyBinding::for_action_in(&RejectAll, &focus_handle, cx))
+    .on_click(|this, window, cx| {
+        this.dispatch_action(&RejectAll, window, cx)
+    })
+
+// Keep All 버튼
+Button::new("keep-all", "Keep All")
+    .key_binding(KeyBinding::for_action_in(&KeepAll, &focus_handle, cx))
+    .on_click(|this, window, cx| {
+        this.dispatch_action(&KeepAll, window, cx)
+    })
+```
+
+### 편집 승인/거부 상세 프로세스
+
+#### Keep 프로세스
+
+1. **선택 영역의 diff hunk 찾기**:
+```rust
+let diff_hunks_in_ranges = editor
+    .diff_hunks_in_ranges(&ranges, buffer_snapshot)
+    .collect::<Vec<_>>();
+```
+
+2. **ActionLog에서 편집 승인**:
+```rust
+for hunk in &diff_hunks_in_ranges {
+    let buffer = multibuffer.read(cx).buffer(hunk.buffer_id);
+    if let Some(buffer) = buffer {
+        action_log.keep_edits_in_range(
+            buffer, 
+            hunk.buffer_range.clone(), 
+            cx
+        );
+    }
+}
+```
+
+3. **diff_base 업데이트**:
+```rust
+// ActionLog 내부
+let old_range = diff_base.point_to_offset(Point::new(edit.old.start, 0))
+    ..diff_base.point_to_offset(Point::new(edit.old.end, 0));
+let new_range = snapshot.point_to_offset(Point::new(edit.new.start, 0))
+    ..snapshot.point_to_offset(Point::new(edit.new.end, 0));
+
+// diff_base를 현재 버퍼 내용으로 교체
+diff_base.replace(
+    old_range,
+    &snapshot.text_for_range(new_range).collect::<String>(),
+);
+```
+
+4. **커서 이동**: 다음 diff hunk로 자동 이동
+
+#### Reject 프로세스
+
+1. **선택 영역의 diff hunk 찾기** (Keep와 동일)
+
+2. **버퍼별로 범위 그룹화**:
+```rust
+let mut ranges_by_buffer = HashMap::default();
+for hunk in &diff_hunks_in_ranges {
+    let buffer = multibuffer.read(cx).buffer(hunk.buffer_id);
+    if let Some(buffer) = buffer {
+        ranges_by_buffer
+            .entry(buffer.clone())
+            .or_insert_with(Vec::new)
+            .push(hunk.buffer_range.clone());
+    }
+}
+```
+
+3. **각 버퍼에서 편집 되돌리기**:
+```rust
+for (buffer, ranges) in ranges_by_buffer {
+    action_log.reject_edits_in_ranges(buffer, ranges, cx)
+}
+```
+
+4. **버퍼를 diff_base 내용으로 복원**:
+```rust
+// ActionLog 내부
+buffer.update(cx, |buffer, cx| {
+    buffer.start_transaction();
+    // 영향받는 범위의 텍스트를 diff_base에서 복원
+    for range in buffer_ranges {
+        let old_text = get_text_from_diff_base(range);
+        buffer.edit([(range, old_text)], None, cx);
+    }
+    buffer.end_transaction(cx);
+});
+```
+
+5. **커서 이동**: 다음 diff hunk로 자동 이동
+
+### 키보드 단축키
+
+기본 키 바인딩:
+
+- **Keep**: 등록된 키 바인딩 (사용자 설정 가능)
+- **Reject**: 등록된 키 바인딩 (사용자 설정 가능)
+- **Keep All**: 등록된 키 바인딩
+- **Reject All**: 등록된 키 바인딩
+- **GoToHunk**: 다음 diff hunk로 이동
+- **GoToPreviousHunk**: 이전 diff hunk로 이동
+
+### 특수 상황 처리
+
+#### 새 파일 생성 시
+
+```rust
+match tracked_buffer.status {
+    TrackedBufferStatus::Created { existing_file_content } => {
+        if let Some(existing_file_content) = existing_file_content {
+            // 기존 내용이 있던 경우 복원
+            buffer.set_text(existing_file_content);
+        } else {
+            // 완전히 새 파일인 경우
+            if is_ai_only_content {
+                // AI만 편집한 경우 파일 삭제
+                project.delete_entry(entry_id, false, cx);
+            } else {
+                // 사용자가 추가 편집한 경우 유지
+            }
+        }
+    }
+}
+```
+
+#### 파일 삭제 시
+
+```rust
+TrackedBufferStatus::Deleted => {
+    // Reject 시 파일을 복원하려 시도
+    // Keep 시 추적 중지
+}
+```
+
+### MultiBuffer를 통한 다중 파일 diff
+
+```rust
+pub struct AgentDiffPane {
+    multibuffer: Entity<MultiBuffer>,  // 여러 파일을 하나의 뷰에 표시
+}
+
+// 각 파일의 diff hunk를 MultiBuffer에 추가
+for (buffer, diff_handle) in buffers_with_diffs {
+    let diff_hunk_ranges = diff
+        .hunks_intersecting_range(Anchor::MIN..Anchor::MAX, &snapshot, cx)
+        .map(|hunk| hunk.buffer_range.to_point(&snapshot))
+        .collect::<Vec<_>>();
+    
+    multibuffer.set_excerpts_for_path(
+        path_key,
+        buffer,
+        diff_hunk_ranges,
+        context_lines,
+        cx,
+    );
+}
+```
+
+### 실시간 diff 업데이트
+
+버퍼가 변경될 때마다 자동으로 diff를 재계산:
+
+```rust
+impl TrackedBuffer {
+    fn schedule_diff_update(&mut self, author: ChangeAuthor, cx: &mut Context<ActionLog>) {
+        // 버퍼 변경 시 BufferDiff 재계산
+        self.diff_handle.update(cx, |diff, cx| {
+            diff.set_base_text(self.diff_base.clone(), cx);
+        });
+    }
+}
+```
+
+### 사용자 편집과 AI 편집 구분
+
+```rust
+pub enum ChangeAuthor {
+    User,   // 사용자가 직접 수정
+    Agent,  // AI 에이전트가 수정
+}
+
+// 사용자 편집 추적
+if tracked_buffer.may_have_unnotified_user_edits {
+    // 사용자가 승인하지 않은 AI 편집 위에 추가 편집을 한 경우
+    // 이를 추적하여 AI에게 알림
+}
+```
+
+### 편집 충돌 해결
+
+AI 편집과 사용자 편집이 겹치는 경우:
+
+1. **사용자 편집 우선**: 사용자가 수정한 부분은 AI 편집으로 덮어쓰지 않음
+2. **알림**: 충돌 발생 시 사용자에게 알림
+3. **선택적 적용**: 사용자가 개별 hunk를 검토하고 선택
+
+### 체크포인트와의 통합
+
+편집 승인/거부는 체크포인트 시스템과 통합됩니다:
+
+```rust
+// 편집 전 체크포인트 생성
+let checkpoint = create_checkpoint(thread, cx)?;
+
+// 편집 수행
+agent.perform_edits(cx);
+
+// 문제 발생 시 체크포인트로 복원
+if needs_revert {
+    restore_checkpoint(thread, checkpoint, cx)?;
+}
+```
+
 ## 프로파일 시스템
 
 ### 내장 프로파일
