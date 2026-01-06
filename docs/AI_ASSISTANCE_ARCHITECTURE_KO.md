@@ -1,500 +1,323 @@
-# Zed AI Assistance 아키텍처 분석
+# Zed AI Assistance 동작 원리
 
-이 문서는 Zed 에디터의 AI 지원 기능이 어떻게 동작하는지에 대한 기술적 분석입니다.
+이 문서는 Zed 에디터의 AI 지원 기능이 어떻게 동작하는지에 대한 원리 설명입니다.
 
 ## 목차
 
 1. [개요](#개요)
-2. [핵심 구성 요소](#핵심-구성-요소)
-3. [언어 모델 시스템](#언어-모델-시스템)
-4. [에이전트 시스템](#에이전트-시스템)
-5. [도구(Tools) 시스템](#도구tools-시스템)
-6. [인라인 어시스턴트](#인라인-어시스턴트)
-7. [데이터 흐름](#데이터-흐름)
-8. [MCP (Model Context Protocol)](#mcp-model-context-protocol)
+2. [전체 동작 흐름](#전체-동작-흐름)
+3. [Agent Panel 동작 원리](#agent-panel-동작-원리)
+4. [Inline Assistant 동작 원리](#inline-assistant-동작-원리)
+5. [도구(Tool) 실행 원리](#도구tool-실행-원리)
+6. [MCP 서버 연동 원리](#mcp-서버-연동-원리)
+7. [에러 처리 및 재시도](#에러-처리-및-재시도)
 
 ---
 
 ## 개요
 
-Zed의 AI 지원 기능은 여러 크레이트(Rust 패키지)로 구성된 모듈식 아키텍처를 가지고 있습니다. 주요 기능은 다음과 같습니다:
+Zed의 AI 지원 기능은 크게 4가지로 구성됩니다:
 
-- **Agent Panel**: LLM과의 대화형 인터페이스로, 코드 생성 및 편집을 수행
-- **Inline Assistant**: 에디터 내에서 직접 코드를 수정하는 기능
-- **Edit Prediction**: AI 기반 코드 자동완성 예측 기능
-- **Text Threads**: 텍스트 기반의 원시적인 대화 인터페이스
-
----
-
-## 핵심 구성 요소
-
-### 크레이트 구조
-
-```
-crates/
-├── agent/                    # 핵심 에이전트 로직
-│   ├── thread.rs             # 대화 스레드 관리
-│   ├── agent.rs              # 에이전트 코어 로직
-│   └── tools/                # 내장 도구들
-├── agent_ui/                 # 에이전트 UI 컴포넌트
-│   ├── agent_panel.rs        # Agent Panel UI
-│   ├── inline_assistant.rs   # 인라인 어시스턴트
-│   └── buffer_codegen.rs     # 버퍼 코드 생성
-├── language_model/           # 언어 모델 추상화 레이어
-│   ├── language_model.rs     # LanguageModel 트레이트 정의
-│   ├── registry.rs           # 모델 레지스트리
-│   └── request.rs            # 요청 구조체
-├── language_models/          # 각 제공자별 구현
-│   └── provider/
-│       ├── anthropic.rs      # Claude 모델
-│       ├── open_ai.rs        # OpenAI 모델
-│       ├── google.rs         # Google AI 모델
-│       ├── ollama.rs         # 로컬 Ollama 모델
-│       └── cloud.rs          # Zed Cloud 제공자
-└── acp_thread/               # Agent Client Protocol
-    ├── acp_thread.rs         # ACP 스레드 구현
-    └── connection.rs         # 연결 관리
-```
-
----
-
-## 언어 모델 시스템
-
-### LanguageModel 트레이트
-
-`language_model` 크레이트에서 정의된 `LanguageModel` 트레이트는 모든 LLM 제공자가 구현해야 하는 인터페이스입니다:
-
-```rust
-pub trait LanguageModel: Send + Sync {
-    // 모델 식별
-    fn id(&self) -> LanguageModelId;
-    fn name(&self) -> LanguageModelName;
-    fn provider_id(&self) -> LanguageModelProviderId;
-    fn provider_name(&self) -> LanguageModelProviderName;
-    
-    // 모델 기능
-    fn supports_images(&self) -> bool;
-    fn supports_tools(&self) -> bool;
-    fn max_token_count(&self) -> u64;
-    
-    // 핵심 메서드
-    fn count_tokens(&self, request: LanguageModelRequest, cx: &App) -> BoxFuture<'static, Result<u64>>;
-    fn stream_completion(&self, request: LanguageModelRequest, cx: &AsyncApp) -> BoxFuture<'static, Result<BoxStream<...>>>;
-}
-```
-
-### 모델 제공자 (Providers)
-
-Zed는 다양한 LLM 제공자를 지원합니다:
-
-| 제공자 | 설명 | 크레이트 |
-|--------|------|----------|
-| **Anthropic** | Claude 모델 (Sonnet, Opus 등) | `provider/anthropic.rs` |
-| **OpenAI** | GPT-4, GPT-4o 등 | `provider/open_ai.rs` |
-| **Google AI** | Gemini 시리즈 | `provider/google.rs` |
-| **Ollama** | 로컬 모델 호스팅 | `provider/ollama.rs` |
-| **Zed Cloud** | Zed의 호스팅 서비스 | `provider/cloud.rs` |
-| **OpenRouter** | 여러 모델 게이트웨이 | `provider/open_router.rs` |
-| **LM Studio** | 로컬 모델 서버 | `provider/lmstudio.rs` |
-| **DeepSeek** | DeepSeek 모델 | `provider/deepseek.rs` |
-| **Mistral** | Mistral AI 모델 | `provider/mistral.rs` |
-
-### LanguageModelRegistry
-
-모델들은 `LanguageModelRegistry`를 통해 관리됩니다:
-
-```rust
-// 전역 레지스트리 접근
-let registry = LanguageModelRegistry::global(cx);
-
-// 기본 모델 가져오기
-let default_model = registry.default_model();
-
-// 특정 모델 선택
-let model = registry.select_model(&selected, cx);
-```
-
----
-
-## 에이전트 시스템
-
-### NativeAgent
-
-`NativeAgent`는 Zed의 내장 에이전트 구현입니다:
-
-```rust
-pub struct NativeAgent {
-    sessions: HashMap<acp::SessionId, Session>,     // 세션 관리
-    history: Entity<HistoryStore>,                   // 대화 기록
-    project_context: Entity<ProjectContext>,         // 프로젝트 컨텍스트
-    context_server_registry: Entity<ContextServerRegistry>, // MCP 서버
-    templates: Arc<Templates>,                       // 프롬프트 템플릿
-    models: LanguageModels,                          // 사용 가능한 모델
-    project: Entity<Project>,                        // 프로젝트 참조
-    prompt_store: Option<Entity<PromptStore>>,       // 프롬프트 저장소
-    fs: Arc<dyn Fs>,                                 // 파일 시스템
-}
-```
-
-### Thread (대화 스레드)
-
-`Thread`는 에이전트와의 대화를 관리합니다:
-
-```rust
-pub struct Thread {
-    id: acp::SessionId,                      // 스레드 ID
-    messages: Vec<Message>,                  // 메시지 목록
-    model: Option<Arc<dyn LanguageModel>>,   // 현재 모델
-    tools: BTreeMap<SharedString, Arc<dyn AnyAgentTool>>, // 사용 가능한 도구
-    running_turn: Option<RunningTurn>,       // 진행 중인 턴
-    pending_message: Option<AgentMessage>,   // 대기 중인 메시지
-    project: Entity<Project>,                // 프로젝트 참조
-    action_log: Entity<ActionLog>,           // 액션 로그
-}
-```
-
-### 메시지 흐름
-
-1. **사용자 메시지 전송** (`Thread::send`)
-   ```rust
-   pub fn send(&mut self, id: UserMessageId, content: impl IntoIterator<Item = T>, cx: &mut Context<Self>) 
-       -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>>
-   ```
-
-2. **모델 응답 처리** (`Thread::run_turn_internal`)
-   - 완료 요청 생성
-   - 스트리밍 응답 처리
-   - 도구 호출 처리
-
-3. **이벤트 스트림** (`ThreadEvent`)
-   ```rust
-   pub enum ThreadEvent {
-       UserMessage(UserMessage),
-       AgentText(String),
-       AgentThinking(String),
-       ToolCall(acp::ToolCall),
-       ToolCallUpdate(ToolCallUpdate),
-       ToolCallAuthorization(ToolCallAuthorization),
-       Retry(RetryStatus),
-       Stop(acp::StopReason),
-   }
-   ```
-
----
-
-## 도구(Tools) 시스템
-
-### AgentTool 트레이트
-
-모든 도구는 `AgentTool` 트레이트를 구현합니다:
-
-```rust
-pub trait AgentTool {
-    type Input: for<'de> Deserialize<'de> + Serialize + JsonSchema;
-    type Output: for<'de> Deserialize<'de> + Serialize + Into<LanguageModelToolResultContent>;
-
-    fn name() -> &'static str;
-    fn description() -> SharedString;
-    fn kind() -> acp::ToolKind;
-    fn initial_title(&self, input: Result<Self::Input, serde_json::Value>, cx: &mut App) -> SharedString;
-    fn run(self: Arc<Self>, input: Self::Input, event_stream: ToolCallEventStream, cx: &mut App) -> Task<Result<Self::Output>>;
-}
-```
-
-### 내장 도구 목록
-
-#### 읽기/검색 도구
-| 도구 | 설명 | 파일 |
+| 기능 | 설명 | 용도 |
 |------|------|------|
-| `diagnostics` | 파일/프로젝트 에러 및 경고 조회 | `diagnostics_tool.rs` |
-| `fetch` | URL 콘텐츠를 Markdown으로 가져오기 | `fetch_tool.rs` |
-| `find_path` | glob 패턴으로 파일 찾기 | `find_path_tool.rs` |
-| `grep` | 정규식으로 코드 검색 | `grep_tool.rs` |
-| `list_directory` | 디렉토리 내용 나열 | `list_directory_tool.rs` |
-| `now` | 현재 날짜/시간 반환 | `now_tool.rs` |
-| `open` | 기본 앱으로 파일/URL 열기 | `open_tool.rs` |
-| `read_file` | 파일 내용 읽기 | `read_file_tool.rs` |
-| `thinking` | 문제 해결을 위한 사고 과정 | `thinking_tool.rs` |
-| `web_search` | 웹 검색 수행 | `web_search_tool.rs` |
-
-#### 편집 도구
-| 도구 | 설명 | 파일 |
-|------|------|------|
-| `copy_path` | 파일/디렉토리 복사 | `copy_path_tool.rs` |
-| `create_directory` | 새 디렉토리 생성 | `create_directory_tool.rs` |
-| `delete_path` | 파일/디렉토리 삭제 | `delete_path_tool.rs` |
-| `edit_file` | 파일 내용 수정 | `edit_file_tool.rs` |
-| `move_path` | 파일/디렉토리 이동 | `move_path_tool.rs` |
-| `save_file` | 파일 저장 | `save_file_tool.rs` |
-| `terminal` | 쉘 명령 실행 | `terminal_tool.rs` |
-
-### 도구 등록
-
-```rust
-pub fn add_default_tools(&mut self, environment: Rc<dyn ThreadEnvironment>, cx: &mut Context<Self>) {
-    self.add_tool(CopyPathTool::new(self.project.clone()));
-    self.add_tool(CreateDirectoryTool::new(self.project.clone()));
-    self.add_tool(DeletePathTool::new(self.project.clone(), self.action_log.clone()));
-    self.add_tool(DiagnosticsTool::new(self.project.clone()));
-    self.add_tool(EditFileTool::new(self.project.clone(), cx.weak_entity(), language_registry, Templates::new()));
-    self.add_tool(FetchTool::new(self.project.read(cx).client().http_client()));
-    self.add_tool(FindPathTool::new(self.project.clone()));
-    self.add_tool(GrepTool::new(self.project.clone()));
-    self.add_tool(ListDirectoryTool::new(self.project.clone()));
-    self.add_tool(MovePathTool::new(self.project.clone()));
-    self.add_tool(NowTool);
-    self.add_tool(OpenTool::new(self.project.clone()));
-    self.add_tool(ReadFileTool::new(cx.weak_entity(), self.project.clone(), self.action_log.clone()));
-    self.add_tool(SaveFileTool::new(self.project.clone()));
-    self.add_tool(RestoreFileFromDiskTool::new(self.project.clone()));
-    self.add_tool(TerminalTool::new(self.project.clone(), environment));
-    self.add_tool(ThinkingTool);
-    self.add_tool(WebSearchTool);
-}
-```
+| **Agent Panel** | 대화형 AI 인터페이스 | 코드 생성, 파일 편집, 질의응답 |
+| **Inline Assistant** | 에디터 내 직접 수정 | 선택 영역 코드 변환 |
+| **Edit Prediction** | 자동완성 예측 | 다음 편집 제안 |
+| **Text Threads** | 원시 텍스트 대화 | 대화 데이터 직접 제어 |
 
 ---
 
-## 인라인 어시스턴트
+## 전체 동작 흐름
 
-### InlineAssistant
+### 1단계: 사용자 입력
 
-`InlineAssistant`는 에디터 내에서 직접 코드를 수정하는 기능을 제공합니다:
-
-```rust
-pub struct InlineAssistant {
-    next_assist_id: InlineAssistId,
-    assists: HashMap<InlineAssistId, InlineAssist>,
-    assists_by_editor: HashMap<WeakEntity<Editor>, EditorInlineAssists>,
-    assist_groups: HashMap<InlineAssistGroupId, InlineAssistGroup>,
-    prompt_history: VecDeque<String>,
-    prompt_builder: Arc<PromptBuilder>,
-    fs: Arc<dyn Fs>,
-}
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      사용자 입력                             │
+├─────────────────────────────────────────────────────────────┤
+│  • 텍스트 프롬프트                                          │
+│  • @멘션 (파일, 디렉토리, 심볼, 이전 스레드)                 │
+│  • 이미지 붙여넣기                                          │
+│  • 선택된 코드 컨텍스트                                     │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 동작 방식
+### 2단계: 요청 구성
 
-1. 사용자가 텍스트 선택 후 `assistant::InlineAssist` 실행
-2. 프롬프트 에디터가 표시됨
-3. 사용자가 프롬프트 입력 후 Enter
-4. 선택된 코드와 프롬프트가 LLM으로 전송
-5. 응답이 스트리밍되면서 선택 영역이 수정됨
-6. 사용자가 변경 사항을 수락하거나 취소
+시스템은 사용자 입력을 받아 LLM 요청을 구성합니다:
+
+1. **시스템 프롬프트 생성**
+   - 프로젝트 구조 정보 수집
+   - Rules 파일 내용 로드 (`.rules`, `.cursorrules` 등)
+   - 사용 가능한 도구 목록 정의
+   - 모델별 특화 지시사항 추가
+
+2. **메시지 이력 포함**
+   - 이전 대화 내용 추가
+   - 컨텍스트 윈도우 내 토큰 수 관리
+
+3. **도구 정의 첨부**
+   - 현재 프로필에서 활성화된 도구들
+   - MCP 서버에서 제공하는 외부 도구들
+
+### 3단계: LLM 스트리밍 응답
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    스트리밍 이벤트                           │
+├─────────────────────────────────────────────────────────────┤
+│  Text        → 일반 텍스트 응답                             │
+│  Thinking    → 모델의 사고 과정 (일부 모델만 지원)          │
+│  ToolUse     → 도구 호출 요청                               │
+│  UsageUpdate → 토큰 사용량 업데이트                         │
+│  Stop        → 응답 종료                                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 4단계: 도구 실행 (필요 시)
+
+모델이 도구 호출을 요청하면:
+1. 도구 입력값 파싱
+2. 도구 실행
+3. 결과를 모델에 전달
+4. 모델이 추가 응답 또는 종료
+
+### 5단계: 결과 표시
+
+- UI에 응답 렌더링
+- 코드 변경사항 diff로 표시
+- 체크포인트 생성 (되돌리기용)
 
 ---
 
-## 데이터 흐름
+## Agent Panel 동작 원리
 
-### 완료 요청 흐름
+### 세션 관리
+
+Agent Panel은 **세션(Session)** 단위로 대화를 관리합니다:
+
+- 각 세션은 고유한 ID를 가짐
+- 세션 내 모든 메시지 이력 보존
+- 세션 간 독립적인 컨텍스트 유지
+
+### 대화 턴(Turn) 처리
+
+하나의 "턴"은 다음 과정으로 구성됩니다:
 
 ```
-┌─────────────┐
-│   사용자    │
-│  프롬프트   │
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐
-│   Thread    │
-│  (send())   │
-└──────┬──────┘
-       │
-       ▼
-┌─────────────────────────────┐
-│   build_completion_request  │
-│  • 시스템 프롬프트 생성     │
-│  • 메시지 이력 포함         │
-│  • 도구 정의 추가           │
-└──────────────┬──────────────┘
-               │
-               ▼
-┌─────────────────────────────┐
-│   LanguageModel             │
-│   stream_completion()       │
-└──────────────┬──────────────┘
-               │
-               ▼
-┌─────────────────────────────┐
-│   스트리밍 이벤트 처리      │
-│  • Text                     │
-│  • Thinking                 │
-│  • ToolUse                  │
-│  • UsageUpdate              │
-│  • Stop                     │
-└──────────────┬──────────────┘
-               │
-               ▼
-┌─────────────────────────────┐
-│   도구 실행 (해당 시)       │
-│  • 입력 파싱                │
-│  • 도구 실행                │
-│  • 결과 수집                │
-└──────────────┬──────────────┘
-               │
-               ▼
-┌─────────────────────────────┐
-│   결과 반환 및 표시         │
-│  • ThreadEvent 방출         │
-│  • UI 업데이트              │
-└─────────────────────────────┘
+사용자 메시지 → LLM 응답 시작 → [도구 호출 → 도구 결과]* → LLM 응답 완료
 ```
 
-### 시스템 프롬프트 구성
+- 도구 호출은 0회 이상 반복될 수 있음
+- 각 도구 결과는 다시 LLM에 전달됨
+- LLM이 "end_turn"을 반환하면 턴 종료
 
-시스템 프롬프트는 `SystemPromptTemplate`를 통해 생성됩니다:
+### 컨텍스트 수집
 
-```rust
-pub struct SystemPromptTemplate {
-    pub project: ProjectContext,     // 프로젝트 정보
-    pub available_tools: Vec<SharedString>, // 사용 가능한 도구
-    pub model_name: Option<String>,  // 모델 이름
-}
-```
+Agent는 다음 정보를 자동으로 수집합니다:
 
-프롬프트에 포함되는 요소:
-- 프로젝트 구조 정보
-- Rules 파일 내용 (`.rules`, `.cursorrules` 등)
-- 사용 가능한 도구 목록
-- 사용자 정의 규칙
+| 컨텍스트 | 설명 |
+|----------|------|
+| 프로젝트 구조 | 워크트리의 디렉토리/파일 구조 |
+| Rules 파일 | `.rules`, `.cursorrules`, `.clinerules` 등 |
+| 사용자 규칙 | 전역 프롬프트 저장소의 기본 규칙 |
+| 활성 파일 | 현재 열려있는 파일 정보 |
+
+### 체크포인트 시스템
+
+AI가 파일을 수정할 때마다:
+1. Git 상태 스냅샷 저장
+2. 변경 전 상태 기록
+3. "Restore Checkpoint" 버튼 활성화
+4. 사용자가 원하면 이전 상태로 복원 가능
 
 ---
 
-## MCP (Model Context Protocol)
+## Inline Assistant 동작 원리
 
-### MCP 서버 통합
+### 기본 동작 방식
 
-Zed는 Model Context Protocol을 통해 외부 도구 및 컨텍스트 서버를 통합합니다:
+1. **선택 영역 감지**: 사용자가 텍스트를 선택하거나 커서 위치의 라인
+2. **프롬프트 에디터 표시**: 선택 영역 위/아래에 입력창 표시
+3. **요청 전송**: 선택된 코드 + 프롬프트를 LLM에 전송
+4. **스트리밍 적용**: 응답을 실시간으로 선택 영역에 적용
+5. **수락/거부**: 사용자가 변경사항을 수락하거나 취소
 
-```rust
-pub struct ContextServerRegistry {
-    server_store: Entity<ContextServerStore>,
-    servers: HashMap<ContextServerId, ContextServerState>,
-}
+### Agent Panel과의 차이점
 
-struct ContextServerState {
-    tools: HashMap<SharedString, Arc<dyn AnyAgentTool>>,
-    prompts: Vec<ContextServerPrompt>,
-}
-```
+| 항목 | Agent Panel | Inline Assistant |
+|------|-------------|------------------|
+| 도구 사용 | 가능 | 불가능 |
+| 다중 파일 편집 | 가능 | 단일 버퍼만 |
+| 대화 이력 | 유지됨 | 단발성 |
+| 컨텍스트 | 자동 수집 | 명시적 추가만 |
 
-### MCP 서버 설정
+### 병렬 생성
 
-`settings.json`에서 MCP 서버를 구성할 수 있습니다:
+Inline Assistant는 동시에 여러 생성을 지원합니다:
 
-```json
-{
-  "context_servers": {
-    "my-server": {
-      "command": "node",
-      "args": ["./server.js"],
-      "env": {}
-    },
-    "remote-server": {
-      "url": "https://api.example.com/mcp",
-      "headers": { "Authorization": "Bearer <token>" }
-    }
-  }
-}
-```
-
-### 확장 기반 MCP 서버
-
-Zed 확장을 통해 MCP 서버를 배포할 수도 있습니다:
-- GitHub MCP Server
-- Puppeteer MCP Server
-- Brave Search MCP Server
-- 등
+- **다중 커서**: 같은 프롬프트로 여러 위치에 동시 생성
+- **다중 모델**: 여러 모델의 결과를 동시에 생성하고 비교 가능
 
 ---
 
-## 프로필 시스템
+## 도구(Tool) 실행 원리
 
-### AgentProfileSettings
+### 도구 호출 흐름
 
-프로필을 통해 도구 세트를 관리할 수 있습니다:
-
-```rust
-pub struct AgentProfileSettings {
-    pub name: SharedString,
-    pub tools: HashMap<SharedString, bool>,           // 내장 도구 활성화
-    pub enable_all_context_servers: bool,             // MCP 서버 전체 활성화
-    pub context_servers: HashMap<String, ContextServerProfile>, // MCP 서버별 설정
-    pub default_model: Option<LanguageModelSelection>, // 기본 모델
-}
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│    LLM이     │ ──▶ │  도구 입력   │ ──▶ │   도구 실행  │
+│  도구 요청   │     │  JSON 파싱   │     │              │
+└──────────────┘     └──────────────┘     └──────┬───────┘
+                                                  │
+┌──────────────┐     ┌──────────────┐             │
+│   LLM에      │ ◀── │   결과를     │ ◀───────────┘
+│ 결과 전달    │     │  문자열 변환 │
+└──────────────┘     └──────────────┘
 ```
 
-### 내장 프로필
+### 내장 도구 분류
 
-1. **Write**: 모든 도구 활성화, 코드 작성용
-2. **Ask**: 읽기 전용 도구만 활성화, 질문용
-3. **Minimal**: 도구 없음, 일반 대화용
+**읽기/검색 도구** (코드베이스 탐색):
+- `read_file`: 파일 내용 읽기
+- `grep`: 정규식 검색
+- `find_path`: glob 패턴 파일 찾기
+- `list_directory`: 디렉토리 내용 나열
+- `diagnostics`: 에러/경고 조회
+
+**편집 도구** (코드베이스 수정):
+- `edit_file`: 파일 내용 수정
+- `create_directory`: 디렉토리 생성
+- `delete_path`: 파일/디렉토리 삭제
+- `move_path`: 파일/디렉토리 이동
+- `terminal`: 쉘 명령 실행
+
+**유틸리티 도구**:
+- `fetch`: URL 콘텐츠 가져오기
+- `web_search`: 웹 검색
+- `thinking`: 사고 과정 기록
+- `now`: 현재 시간 조회
+
+### 도구 승인 시스템
+
+`always_allow_tool_actions` 설정에 따라:
+- **true**: 모든 도구 자동 실행
+- **false**: 편집/실행 도구는 사용자 승인 필요
+
+승인 요청 시 표시되는 옵션:
+- "Allow" - 이번만 허용
+- "Always Allow" - 항상 허용
+- "Deny" - 거부
+
+---
+
+## MCP 서버 연동 원리
+
+### MCP (Model Context Protocol)란?
+
+MCP는 LLM 애플리케이션과 외부 데이터 소스/도구를 연결하는 표준 프로토콜입니다.
+
+### 연동 방식
+
+1. **로컬 프로세스 방식**
+   - Zed가 MCP 서버 프로세스를 직접 실행
+   - stdin/stdout으로 JSON-RPC 통신
+
+2. **원격 서버 방식**
+   - HTTP/WebSocket을 통한 원격 MCP 서버 연결
+
+### MCP 서버가 제공하는 것
+
+- **도구(Tools)**: 내장 도구처럼 LLM이 호출 가능
+- **프롬프트(Prompts)**: `/명령어` 형태로 사용 가능
+- **리소스(Resources)**: 컨텍스트로 추가 가능한 데이터
+
+### 도구 충돌 해결
+
+같은 이름의 도구가 여러 MCP 서버에서 제공될 때:
+- 서버 ID를 접두어로 붙여 구분 (예: `server1_tool_name`)
+- 프로필 설정에서 특정 서버의 도구만 활성화 가능
 
 ---
 
 ## 에러 처리 및 재시도
 
-### 재시도 전략
+### 자동 재시도 대상
 
-```rust
-enum RetryStrategy {
-    ExponentialBackoff {
-        initial_delay: Duration,
-        max_attempts: u8,
-    },
-    Fixed {
-        delay: Duration,
-        max_attempts: u8,
-    },
-}
-```
+| 에러 유형 | 재시도 전략 | 최대 시도 |
+|-----------|-------------|-----------|
+| Rate Limit (429) | 지수 백오프 | 4회 |
+| 서버 과부하 (503) | 고정 지연 | 4회 |
+| 서버 오류 (500) | 고정 지연 | 3회 |
+| 네트워크 오류 | 고정 지연 | 3회 |
 
-### 재시도 가능한 에러
+### 재시도하지 않는 에러
 
-- `TOO_MANY_REQUESTS`: Rate limit 초과
-- `SERVICE_UNAVAILABLE`: 서버 과부하
-- `INTERNAL_SERVER_ERROR`: 서버 오류 (최대 3회)
-- 네트워크 오류: 일시적 연결 문제
-
-### 재시도 불가능한 에러
-
-- `PAYLOAD_TOO_LARGE`: 프롬프트가 너무 큽니다
-- `UNAUTHORIZED`: 인증 실패
-- `FORBIDDEN`: 권한 없음
+- 인증 실패 (401, 403)
+- 프롬프트 너무 큼 (413)
 - API 키 없음
+- 모델 요청 한도 초과
+
+### 재시도 중 UI 표시
+
+재시도 시 사용자에게 표시되는 정보:
+- 마지막 에러 메시지
+- 현재 시도 횟수 / 최대 시도 횟수
+- 다음 재시도까지 남은 시간
 
 ---
 
-## 주요 설정 옵션
+## 프로필 시스템
 
-### agent 설정
+### 프로필의 역할
 
-```json
-{
-  "agent": {
-    "default_model": {
-      "provider": "anthropic",
-      "model": "claude-sonnet-4-20250514"
-    },
-    "default_profile": "Write",
-    "always_allow_tool_actions": false,
-    "inline_alternatives": [],
-    "notify_when_agent_waiting": true,
-    "play_sound_when_agent_done": false
-  }
-}
-```
+프로필은 **도구 세트를 그룹화**하여 상황에 맞게 전환할 수 있게 합니다.
+
+### 내장 프로필
+
+| 프로필 | 활성화된 도구 | 용도 |
+|--------|---------------|------|
+| **Write** | 모든 도구 | 코드 작성, 파일 수정 |
+| **Ask** | 읽기 전용 도구만 | 코드 이해, 질문 |
+| **Minimal** | 도구 없음 | 일반 대화 |
+
+### 커스텀 프로필
+
+사용자가 직접 프로필을 정의할 수 있습니다:
+- 특정 도구만 활성화
+- 특정 MCP 서버만 활성화
+- 기본 모델 지정
 
 ---
 
-## 결론
+## 토큰 사용량 관리
 
-Zed의 AI 지원 시스템은 다음과 같은 핵심 원칙을 따릅니다:
+### 컨텍스트 윈도우
 
-1. **모듈화**: 각 기능이 독립적인 크레이트로 분리
-2. **추상화**: `LanguageModel` 트레이트를 통한 다양한 제공자 지원
-3. **확장성**: MCP를 통한 외부 도구 통합
-4. **유연성**: 프로필을 통한 도구 세트 관리
-5. **안정성**: 재시도 전략과 에러 처리
+각 모델은 최대 컨텍스트 윈도우(토큰 수)가 있습니다:
+- 시스템 프롬프트 + 대화 이력 + 도구 정의가 모두 포함
+- 한도에 가까워지면 경고 배너 표시
+- "새 스레드로 요약" 기능으로 컨텍스트 초기화 가능
 
-이 아키텍처는 새로운 LLM 제공자 추가, 커스텀 도구 개발, MCP 서버 통합을 쉽게 할 수 있도록 설계되었습니다.
+### 토큰 추적
+
+실시간으로 추적되는 정보:
+- 입력 토큰 수
+- 출력 토큰 수
+- 캐시된 토큰 수 (지원하는 모델의 경우)
+
+---
+
+## 요약
+
+Zed AI의 핵심 동작 원리:
+
+1. **사용자 입력** → 프롬프트, 멘션, 컨텍스트 수집
+2. **요청 구성** → 시스템 프롬프트 + 이력 + 도구 정의
+3. **LLM 호출** → 스트리밍 응답 처리
+4. **도구 실행** → 필요시 도구 호출 및 결과 반환
+5. **결과 표시** → UI 업데이트, diff 표시, 체크포인트 생성
+
+이 흐름은 Agent Panel, Inline Assistant 모두에서 유사하게 적용되며,
+MCP 서버를 통해 외부 도구로 확장할 수 있습니다.
